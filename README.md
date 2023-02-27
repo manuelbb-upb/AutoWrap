@@ -3,6 +3,12 @@
 
 A result from musings concerning https://github.com/JuliaSymbolics/Symbolics.jl/pull/813.
 
+## Questions
+
+Testing is needed! Does this solve pre-compilation issues?
+
+## Examples
+
 Explicit `AutoWrapContext`:
 ```julia
 using AutoWrap
