@@ -1,0 +1,7 @@
+name = "TestPackage"
+uuid = "58790fe2-1365-4112-aeb7-abc4dbb16099"
+authors = ["Manuel Berkemeier <manuelbb@mail.uni-paderborn.de>"]
+version = "0.0.1"
+
+[deps]
+AutoWrap = "b28b87c8-a228-4bfa-a330-38707e5fee2d"
