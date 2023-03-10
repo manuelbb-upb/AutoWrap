@@ -23,7 +23,7 @@ make_sexy(x::Number) = myNumber(x)
 plus(x::Number, y::myNumber) = x + make_boring(y)
 
 arg_type_mapping(T::Type{<:Number}) = (T, myNumber)
-preprocessing_function(args...) = ((isa(a, myNumber) ? make_boring(a) : a for a in args), nothing)
+preprocessing_function(args...) = ([AW.NewDef(); [isa(a, myNumber) ? make_boring(a) : a for a in args]], nothing)
 
 @make_macro ctx_warn = AutoWrapContext(; arg_type_mapping, preprocessing_function)
 

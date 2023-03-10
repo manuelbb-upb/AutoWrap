@@ -6,17 +6,224 @@ export @make_macro, @wrap_with_context
 
 import ExprTools as ET
 
+include("utils.jl")
+
 abstract type AbstractFallbackArg end
 
-struct FallbackUntyped <: AbstractFallbackArg end
-struct FallbackTyped <: AbstractFallbackArg end
-struct Fallback <: AbstractFallbackArg end
+struct NewDefUntyped <: AbstractFallbackArg end
+struct NewDef <: AbstractFallbackArg end
+struct Wrapped <: AbstractFallbackArg end
 
-const DEFAULT_PREPROCESSING_FUNCTION(args...) = (args, nothing)
+abstract type AbstractBodyWrapper end
+
+eval_wrapped(::AbstractBodyWrapper, body_fn, args...) = body_fn(NewDef(), args...)
+
+struct PrePostProcessingWrapper{TypedBodyFlag, A, Z} <: AbstractBodyWrapper
+    preprocessing_function :: A
+    postprocessing_function :: Z
+    function PrePostProcessingWrapper(;
+        preprocessing_function::A=DEFAULT_PREPROCESSING_FUNCTION,
+        postprocessing_function::Z=DEFAULT_POSTPROCESSING_FUNCTION, 
+        typed_body::Bool=false
+    ) where {A, Z}
+        return new{typed_body, A, Z}(preprocessing_function, postprocessing_function)
+    end
+end
+_extra_arg(::PrePostProcessingWrapper{true}) = NewDef()
+_extra_arg(::PrePostProcessingWrapper{false}) = NewDefUntyped()
+function eval_wrapped(w::PrePostProcessingWrapper, body_fn, args...)
+    (_args, meta) = w.preprocessing_function(args...)
+    ret = body_fn(_args...)
+    return w.postprocessing_function(ret, meta)
+end
+
+abstract type AbstractNewMethodCondition end
+struct NewMethodCondition <: AbstractNewMethodCondition
+end
+check_condition(::NewMethodCondition, sigtt, mdict) = true
+
+abstract type AbstractArgTypesMapping end
+
+"Map a method signature to at least one new signature (or an iterable of signatures)."
+apply_type_mapping(::AbstractArgTypesMapping, sigtt, query_sigtt) = sigtt
+
+function handle_new_sigs(::AbstractArgTypesMapping, vec_new_sigtt, vec_prev_sigtt)
+    return tt_union(vec_new_sigtt, vec_prev_sigtt)
+end
+function handle_existing_sigs(::AbstractArgTypesMapping, vec_new_sigtt, vec_existing_sigtt)
+    return setdiff(vec_new_sigtt, vec_existing_sigtt)
+end
+
+const DEFAULT_PREPROCESSING_FUNCTION(args...) = ((NewDef(), args...), nothing)
 const (DEFAULT_POSTPROCESSING_FUNCTION(ret::R, meta)::R) where R = ret
+
+const DEFAULT_NEW_METHOD_CONDITION(@nospecialize(arg_tuple_type)) = true
 
 DEFAULT_ARG_TYPE_MAPPING(T) = T
 DEFAULT_ARG_TYPE_MAPPING(tv::TypeVar) = tv.ub
+
+Base.@kwdef struct ArgTypeExpander{F} <: AbstractArgTypesMapping
+    arg_type_mapping :: F = DEFAULT_ARG_TYPE_MAPPING
+    drop_n :: Int = 0
+end
+
+function apply_type_mapping(m::ArgTypeExpander, _sigtt, query_sigtt)
+    sigtt = typeintersect(
+        _sigtt, query_sigtt
+    )
+    sig_params = ET.parameters(sigtt)
+    func_t = sig_params[1]
+    arg_ts = sig_params[2:end]
+
+    type_mapping = m.arg_type_mapping
+    drop_n = m.drop_n
+
+    atype_options = Any[]
+    for atype in arg_ts
+        # NOTE if `atype` is not a type variable, then it could have free type variables here. 
+        # is this a problem? We **do** rewrap below...
+        _aopts = try
+            type_mapping(atype)
+        catch e
+            if e isa MethodError && atype isa TypeVar
+                type_mapping(atype.ub)
+            else
+                throw(e)
+            end
+        end
+        aopts = ensure_iterable(_aopts)
+        push!(atype_options, aopts)
+    end
+
+    vec_new_sigtt = collect(
+        Any, 
+        map(Iterators.drop(Iterators.product( atype_options... ), drop_n)) do ttuple
+            Base.rewrap_unionall( Tuple{func_t, ttuple... }, sigtt )
+        end
+    )
+    return tt_unique(vec_new_sigtt)
+end
+
+function gather_existing_sigtts(
+    func, query_sigtt, method_mods=nothing
+)
+    ret_vec = Any[]
+    isnothing(method_mods) && return ret_vec
+    ms = if isempty(method_mods)
+        methods(func, query_sigtt)
+    else
+        methods(func, query_sigtt, method_mods)
+    end
+    for met in ms
+        _sigtt = met.sig
+        push!(ret_vec, _sigtt)
+    end 
+    return ret_vec
+end
+
+function sigtt_from_sigdict_expr(sigdict)
+    quote
+        Tuple{ typeof($(sigdict[:name])), $(sigdict[:arg_type_exs]...) } where{
+            $(sigdict[:whereparams]...)
+        }
+    end
+end
+
+@nospecialize
+function create_typed_body_method(
+    eval_mod, body_fn, sigtt
+)
+    mdict = ET.signature(sigtt)
+    inner_args = isempty(mdict[:args]) ? Symbol[] : _arg_name_expr.(mdict[:args])
+    pushfirst!(mdict[:args], :(::$(NewDef)))
+    mdict[:body] = quote
+        $(body_fn)( $(NewDefUntyped()), $(inner_args...) )
+    end
+
+    method_expr = ET.combinedef(mdict)
+    Core.eval(eval_mod, method_expr)
+end
+@specialize
+
+function create_wrapped_body_method(
+    eval_mod, body_wrapper, body_fn, sigtt
+)
+    global eval_wrapped
+    mdict = ET.signature(sigtt)
+    inner_args = isempty(mdict[:args]) ? Symbol[] : _arg_name_expr.(mdict[:args])
+    pushfirst!(mdict[:args], :(::$(Wrapped)))
+    mdict[:body] = quote
+        $(eval_wrapped)( $(body_wrapper), $(body_fn), $(inner_args...) )
+    end
+
+    method_expr = ET.combinedef(mdict)
+    Core.eval(eval_mod, method_expr)
+end
+
+function define_methods_for_new_sigtts(
+    eval_mod, body_fn, new_sigtts, new_method_condition
+)
+    # build method definitons from the type option tuples
+    func_name = :((::$(typeof(body_fn))))
+    for stt in new_sigtts
+        mdict = ET.signature(stt)
+        mdict[:name] = func_name
+        inner_args = isempty(mdict[:args]) ? Symbol[] : _arg_name_expr.(mdict[:args])
+        mdict[:body] = quote
+            return $(body_fn)($(Wrapped()), $(inner_args...))
+        end
+        if check_condition(new_method_condition, stt, mdict)
+            method_expr = ET.combinedef(mdict)
+            Core.eval(eval_mod, method_expr)
+        end
+    end
+    @debug "AutoWrap.jl: Time for new method definitions: $(stats.time) secs."
+    return nothing
+end
+
+Base.@kwdef struct WrappingContextDev1
+    arg_types_mapping :: AbstractArgTypesMapping = ArgTypeExpander()
+    body_wrapper :: AbstractBodyWrapper = PrePostProcessingWrapper()
+    method_lookup_modules :: Union{Nothing, Vector{<:Module}} = nothing
+end
+Base.@kwdef struct WrappingContextDev2
+    arg_types_mapping :: AbstractArgTypesMapping = ArgTypeExpander()
+    body_wrapper :: AbstractBodyWrapper = PrePostProcessingWrapper()
+    new_method_condition :: AbstractNewMethodCondition = NewMethodCondition()
+    method_lookup_modules :: Union{Nothing, Vector{<:Module}} = nothing
+end
+WrappingContext = WrappingContextDev2
+export WrappingContext
+
+macro contextual_wrap(ctx, func_ex)
+    func_def = safe_splitdef(func_ex)
+    efunc_name = :($(esc(func_def[:name])))
+    ectx = :($(esc(ctx)))
+    quote
+        $(esc(generic_fallback_expr(func_def)))
+        sigtt = $(esc(sigtt_from_sigdict_expr(func_def)))
+        wrapper = $(ectx).body_wrapper
+        $(create_typed_body_method)($(__module__), $(efunc_name), sigtt)
+        $(create_wrapped_body_method)($(__module__), wrapper, $(efunc_name), sigtt)
+
+        atm = $(ectx).arg_types_mapping
+
+        new_sigtts = $(apply_type_mapping)(atm, sigtt, sigtt)
+        existing_sigtts = $(gather_existing_sigtts)(
+            $(efunc_name), sigtt, $(ectx).method_lookup_modules,
+        )
+        for esigtt in existing_sigtts
+            more_sigtts = $(apply_type_mapping)(atm, esigtt, sigtt)
+            new_sigtts = $(handle_new_sigs)(atm, more_sigtts, new_sigtts)
+        end
+        new_sigtts = $(handle_existing_sigs)(atm, new_sigtts, existing_sigtts)
+
+        $(define_methods_for_new_sigtts)(
+            $(__module__), $(efunc_name), new_sigtts, $(ectx).new_method_condition,
+        )
+    end
+end
+export @contextual_wrap
 
 """
     AutoWrapContext(;
@@ -46,7 +253,7 @@ Return a context for automatically wrapping a function definition with
   defining them.
 * `typed_body::Bool`: Bool indicating whether or not to artificially throw a 
   MethodError for signatures not meant to exist for the function body...
-"""
+"""# TODO update docstring
 Base.@kwdef struct AutoWrapContext
 
     "A function mapping types or type variables to types or type variables or tuples thereof."
@@ -64,7 +271,7 @@ Base.@kwdef struct AutoWrapContext
     "List of modules to look up method definitions in (or `nothing` for calling scope)."
     method_lookup_modules :: Union{Nothing, Vector{<:Module}} = nothing
 
-    "Bool indicating whether to check for existing methods before defining them."
+    "Bool indicating whether to check for existing methods before overwriting them."
     check_hasmethod :: Bool = false
 
     typed_body :: Bool = false
@@ -119,45 +326,6 @@ macro make_macro(ctx_expr)
     end
 end
 
-"""
-    _arg_type_expr(arg_expr)
-
-Return the type expression parsed from `arg_expr`. `arg_ex` comes from a method definition 
-and can be as simple as `arg_name` or `arg_name::arg_type`, but all valid expressions are 
-possible.
-"""
-function _arg_type_expr(arge)
-    if Meta.isexpr(arge, :(::), 2)  
-        # :(arg_name :: arg_type) ↦ :(arg_type)
-        # :(arg_name :: arg_type{type_var_symbol}) ↦ :(arg_type{type_var_symbol})
-        # :(arg_name :: arg_type{type_var_symbol} where {type_var_symbol}) ↦
-        #   :(arg_type{type_var_symbol} where {type_var_symbol})
-        # :(arg_name :: Vararg{...}) ↦ :(Vararg{...})
-        return arge.args[2]
-    elseif Meta.isexpr(arge, :(::), 1) 
-        # :(:: arg_type) ↦ :(arg_type)
-        return arge.args[1]
-    elseif Meta.isexpr(arge, :(...), 1)
-        # :(args...) ↦ :(Vararg{Any})
-        # :(args::Int...) ↦ :(Vararg{Int})
-        return :(Vararg{$(_arg_type_expr(arge.args[1]))})
-    else
-        return :Any
-    end
-end
-
-"""
-    _arg_name_expr(arg_expr)
-
-Return the argument name parsed from `arg_expr`. `arg_ex` comes from a method definition 
-and can be as simple as `arg_name` or `arg_name::arg_type`, but all valid expressions are 
-possible.
-"""
-_arg_name_expr(arge::Symbol) = arge
-function _arg_name_expr(arge)
-    Meta.isexpr(arge, :(::), 2) && return arge.args[1]
-    return gensym("unused")
-end
 
 # https://github.com/JuliaLang/julia/issues/48777
 """
@@ -175,9 +343,7 @@ function contains_type(arr, tuple_type)
 end
 
 # helper to ensure tuple format (important for when `arg_type_mapping` does not return tuples)
-ensure_iterable(t::Tuple)=t
-ensure_iterable(t::Vector)=t
-ensure_iterable(x) = (x,)
+
 
 """
     _type_options_for_sig_arg_tuple!(unique_tuple_types_arr, sig_tuple_type, type_mapping, drop_n=1)
@@ -186,8 +352,10 @@ Fill the array `unique_tuple_types_arr` with tuple types, the parameters of whic
 argument types. `type_mapping` is an function mapping types and type variables to types and 
 type variables or tuples of either and `drop_n` is an internal varible to filter
 redundant tuples.
-"""
-function _type_options_for_sig_arg_tuple!(unique_tuple_types_arr, sig_tuple_type, type_mapping, drop_n=0)
+"""#TODO update docstring
+function _type_options_for_sig_arg_tuple!(
+    unique_tuple_types_arr, existing_tuple_types, @nospecialize(sig_tuple_type), type_mapping, check_hasmethod, drop_n=0
+)
     
     sig_params = ET.parameters(sig_tuple_type)
 
@@ -195,15 +363,28 @@ function _type_options_for_sig_arg_tuple!(unique_tuple_types_arr, sig_tuple_type
     for atype in sig_params
         # NOTE if `atype` is not a type variable, then it could have free type variables here. 
         # is this a problem? If so, we can easily rewrap (see below)
-        push!(atype_options, ensure_iterable(type_mapping(atype)))
+        _aopts = try
+            type_mapping(atype)
+        catch e
+            if e isa MethodError && atype isa TypeVar
+                type_mapping(atype.ub)
+            else
+                throw(e)
+            end
+        end
+        aopts = ensure_iterable(_aopts)
+        push!(atype_options, aopts)
     end
 
     for ttuple in Iterators.drop(Iterators.product( atype_options... ), drop_n)
         tuple_type = Base.rewrap_unionall( Tuple{ ttuple... }, sig_tuple_type )
-        #if !(tuple_type in unique_tuple_types_arr)
-        if !(contains_type(unique_tuple_types_arr, tuple_type))
-            push!(unique_tuple_types_arr, tuple_type)
+        if check_hasmethod && contains_type(@show(existing_tuple_types), @show(tuple_type))
+            continue
         end
+        if contains_type(unique_tuple_types_arr, tuple_type)
+            continue
+        end
+        push!(unique_tuple_types_arr, tuple_type)
     end
     nothing
 end
@@ -249,47 +430,50 @@ function define_methods(
         mdict[:name] = func_name
         _match_argnames!(mdict, arg_name_exs)       # or re-parse argument names from `mdict`
         mdict[:body] = quote
-            return $(body_fn)($(Fallback()), $(arg_name_exs...))
+            return $(body_fn)($(Wrapped()), $(arg_name_exs...))
         end
         method_expr = ET.combinedef(mdict)
         if check_hasmethod
             method_expr = quote
+                display( $(stt) )
                 if !hasmethod($(body_fn), $(stt))
+                    println("DEFINE")
                     @eval $(method_expr)
                 end
             end
         end
         Core.eval(eval_mod, method_expr)
     end
+    @debug "AutoWrap.jl: Time for new method definitions: $(stats.time) secs."
     return nothing
 end
 
-function make_wrapped_fallback(
-    eval_mod, fallback_fn, arg_name_exs, arg_tuple_type
+function make_newdef_fallback(
+    eval_mod, fallback_fn, arg_name_exs, @nospecialize(arg_tuple_type)
 )
     func_name = :((::$(typeof(fallback_fn))))
     mdict = signature_without_name(arg_tuple_type)
     mdict[:name] = func_name
     _match_argnames!(mdict, arg_name_exs)
-    pushfirst!(mdict[:args], :(::$(FallbackTyped)))
+    pushfirst!(mdict[:args], :(::$(NewDef)))
     mdict[:body] = quote
-        $(fallback_fn)($(FallbackUntyped()), $(arg_name_exs...))
+        $(fallback_fn)($(NewDefUntyped()), $(arg_name_exs...))
     end
     method_expr = ET.combinedef(mdict)
     Core.eval(eval_mod, method_expr)
 end
 
-function make_final_fallback(
+function make_wrapped_fallback(
     eval_mod, fallback_fn, arg_name_exs, preprocessing_function, postprocessing_function,
 )
     mdict = Dict(
         :name => :((::$(typeof(fallback_fn)))),
         :args => Vector{Any}(arg_name_exs),
     )
-    pushfirst!(mdict[:args], :(::$(Fallback)))
+    pushfirst!(mdict[:args], :(::$(Wrapped)))
     mdict[:body] = quote
         _args, meta = $(preprocessing_function)($(arg_name_exs...))
-        ret = $(fallback_fn)($(FallbackTyped()), _args...)
+        ret = $(fallback_fn)(_args...)
         return $(postprocessing_function)(ret, meta) 
     end
     method_expr = ET.combinedef(mdict)
@@ -299,9 +483,9 @@ end
 function generic_fallback_expr(func_def)
     fallback_def = copy(func_def)
     empty!(fallback_def[:args])
-    push!(fallback_def[:args], :(::$(FallbackUntyped)))
+    push!(fallback_def[:args], :(::$(NewDefUntyped)))
     append!(fallback_def[:args], fallback_def[:arg_name_exs])
-    return ET.combinedef(fallback_def) |> esc
+    return ET.combinedef(fallback_def)
 end
 
 function make_closure_expr(
@@ -313,7 +497,12 @@ function make_closure_expr(
     func_name = haskey(func_def, :name) ? func_def[:name] : error("Cannot specialize an unnamed anonymous function.")
     func_nargs = length(func_def[:args])
 
-    fallback_untyped_expr = generic_fallback_expr(func_def)
+    fallback_untyped_expr = generic_fallback_expr(func_def) |> esc
+
+    defined_methods_sym = gensym("defined_methods")
+    existing_tuple_types_sym = gensym("existing_tuple_types")
+    arg_tuple_type_sym = gensym("arg_tuple_type")
+    new_ms_tuple_types_sym = gensym("new_ms_tuple_types")
 
     def_globals_expr = quote
         # Declaration as global constants is crucial for performance
@@ -324,7 +513,7 @@ function make_closure_expr(
                 let ctx = $($(ctx_ex));
                 $(
                     [ 
-                        :(global const $(gs) = deepcopy(getfield(ctx, $(Meta.quot(fn)))))
+                        :(global const $(gs) = getfield(ctx, $(Meta.quot(fn))))
                             for (fn, gs) in $(ctx_dict) 
                     ]...
                 )
@@ -334,16 +523,18 @@ function make_closure_expr(
     end |> esc
 
     gather_sig_types_expr = quote
+        $(existing_tuple_types_sym) = Any[]
         if !isnothing($(ctx_dict[:method_lookup_modules]))
-            defined_methods = methods($(func_name), $(ctx_dict[:method_lookup_modules]))
-
-            for m in defined_methods
-                m_tuple_type = typeintersect(
-                    Base.rewrap_unionall(Base.unwrap_unionall(m.sig).parameters[2:end], m.sig),
-                    arg_tuple_type
+            $(defined_methods_sym) = methods($(func_name), $(arg_tuple_type_sym), $(ctx_dict[:method_lookup_modules]))
+            for m in $(defined_methods_sym)
+                sig_tuple_type = Base.rewrap_unionall(
+                    Tuple{Base.unwrap_unionall(m.sig).parameters[2:end]...}, 
+                    m.sig
                 )
+                m_tuple_type = typeintersect(sig_tuple_type, $(arg_tuple_type_sym))
+                push!($(existing_tuple_types_sym), sig_tuple_type)
                 $(_type_options_for_sig_arg_tuple!)(
-                    new_ms_tuple_types, m_tuple_type, $(ctx_dict[:arg_type_mapping])
+                    $(new_ms_tuple_types_sym), $(existing_tuple_types_sym), m_tuple_type, $(ctx_dict[:arg_type_mapping]), $(ctx_dict[:check_hasmethod])
                 )
             end 
         end
@@ -354,208 +545,63 @@ function make_closure_expr(
         
         $(fallback_untyped_expr)
 
-        new_ms_tuple_types = $(esc(:(Any[])))
-        arg_tuple_type = $(esc(:(
+        $(esc(new_ms_tuple_types_sym)) = $(esc(:(Any[])))
+        $(esc(arg_tuple_type_sym)) = $(esc(:(
             Tuple{
                 $(func_def[:arg_type_exs]...)} where {$(func_def[:whereparams]...)
             }
         )))
 
         fback_arg_tuple_type = if $(esc(ctx_dict[:typed_body]))
-            arg_tuple_type
+            $(esc(arg_tuple_type_sym))
         else
             $(esc(:(NTuple{$(func_nargs), Any})))
         end
         
-        $(make_wrapped_fallback)(
+        $(make_newdef_fallback)(
             $(__module__), $(esc(func_name)), $(func_def[:arg_name_exs]), fback_arg_tuple_type
         )
-        $(make_final_fallback)(
+        $(make_wrapped_fallback)(
             $(__module__), $(esc(func_name)), $(func_def[:arg_name_exs]),
             $(esc(ctx_dict[:preprocessing_function])), $(esc(ctx_dict[:postprocessing_function]))
         )
                 
         $(_type_options_for_sig_arg_tuple!)(
-            new_ms_tuple_types, arg_tuple_type, 
-            $(esc(ctx_dict[:arg_type_mapping]))
+            $(esc(new_ms_tuple_types_sym)), [], $(esc(arg_tuple_type_sym)), 
+            $(esc(ctx_dict[:arg_type_mapping])), $(esc(ctx_dict[:check_hasmethod]))
         )
 
+        initial_tuple_type_indices = $(esc(:(eachindex($(new_ms_tuple_types_sym)))))
+
         $(gather_sig_types_expr)
+
+        # the list of existing function signature types did not yet exist when making 
+        # the first few new signatures; check them now:
+        if $(esc(ctx_dict[:check_hasmethod])) && !isempty($(esc(existing_tuple_types_sym)))
+            del_indices = empty(initial_tuple_type_indices)
+            for i in initial_tuple_type_indices
+                if $(contains_type)($(esc(existing_tuple_types_sym)), $(esc(new_ms_tuple_types_sym))[i])
+                    push!(del_indices, i)
+                end
+            end
+            deleteat!($(esc(new_ms_tuple_types_sym)), del_indices)
+        end
         
         $(define_methods)(
-            $(__module__), $(esc(func_name)), new_ms_tuple_types, $(func_def[:arg_name_exs]), 
+            $(__module__), $(esc(func_name)), $(esc(new_ms_tuple_types_sym)), $(func_def[:arg_name_exs]), 
             $(esc(ctx_dict[:check_hasmethod]))
+            #$(esc(ctx_dict[:new_method_condition]))
         )
     end
 end
 
-#=
-function make_closure_expr(
-    __module__, ctx_ex, func_ex
-)
-    ctx_global_syms_dict = ctx_gensyms()
-    
-    func_def = safe_splitdef(func_ex)
-    func_name = haskey(func_def, :name) ? func_def[:name] : error("Cannot specialize an unnamed anonymous function.")
-
-    func_body_symb = gensym("func_body")
-    func_body_symb_typed = gensym("func_body_typed")
-    func_body_symb_untyped = gensym("func_body_untyped")
-
-    # make the expressions for the fallback funtion body(s)
-    cl_body_np_ex_typed = make_fallback_noprocessing_expr(func_def, func_body_symb, true)
-    cl_body_np_ex_untyped = make_fallback_noprocessing_expr(func_def, func_body_symb, false)
-    #cl_body_np_ex_typed = make_fallback_noprocessing_expr_anon(func_def, true)
-    #cl_body_np_ex_untyped = make_fallback_noprocessing_expr_anon(func_def, false)
-    cl_body_np_ex_user = make_fallback_noprocessing_expr_for_user(func_def, func_body_symb)
-    cl_body_ex = make_fallback_expr(
-        func_def, func_body_symb, ctx_global_syms_dict[:preprocessing_function], 
-        ctx_global_syms_dict[:postprocessing_function]
-    )
-
-    return quote
-        # Declaration as global constants is crucial for performance
-        # `deepcopy` is mostly a no-op though (except maybe for anonymous functions)
-        Core.eval( 
-            $(__module__), 
-            quote 
-                let ctx = $($(esc(ctx_ex)));
-                $(
-                    [ 
-                        :(global const $(gs) = deepcopy(getfield(ctx, $(Meta.quot(fn)))))
-                            for (fn, gs) in $(ctx_global_syms_dict) 
-                    ]...
-                )
-                end#let
-            end#quote
-        )
-        
-        #=$(esc(func_body_symb)) = if $(esc(ctx_global_syms_dict[:typed_body]))
-            $(esc(cl_body_np_ex_typed))
-        else
-            $(esc(cl_body_np_ex_untyped))
-        end=#
-        $(esc(cl_body_np_ex_typed))
-        $(esc(cl_body_np_ex_untyped))
-        #=$(esc(func_body_symb)) = if $(esc(ctx_global_syms_dict[:typed_body])) isa Val{true}
-            $(esc(func_body_symb_typed))
-        else
-            $(esc(func_body_symb_untyped))
-        end=#
-        @show isconst($(__module__), $(Meta.quot(ctx_global_syms_dict[:typed_body])))
-        $(esc(cl_body_np_ex_user))
-        $(esc(cl_body_ex))
-        
-        new_ms_tuple_types = Any[]
-        arg_tuple_type = Tuple{
-            $(esc.(func_def[:arg_type_exs])...)} where {$(esc.(func_def[:whereparams])...)
-        }
-
-        $(_type_options_for_sig_arg_tuple!)(
-            new_ms_tuple_types, arg_tuple_type, 
-            $(esc(ctx_global_syms_dict[:arg_type_mapping]))
-        )
-        
-        if !isnothing($(esc(ctx_global_syms_dict[:method_lookup_modules])))
-            defined_methods = methods($(esc(func_name)), $(esc(ctx_global_syms_dict[:method_lookup_modules])))
-
-            for m in defined_methods
-                m_tuple_type = typeintersect(
-                    Base.rewrap_unionall(Base.unwrap_unionall(m.sig).parameters[2:end], m.sig),
-                    arg_tuple_type
-                )
-                $(_type_options_for_sig_arg_tuple!)(
-                    new_ms_tuple_types, m_tuple_type, $(esc(ctx_global_syms_dict[:arg_type_mapping]))
-                )
-            end 
-        end
-        
-        arg_name_exs = [ $((Meta.quot.(func_def[:arg_name_exs]))...) ]
-        $(define_methods)(
-            $(__module__), $(esc(func_name)), new_ms_tuple_types, arg_name_exs, 
-            $(esc(ctx_global_syms_dict[:check_hasmethod]))
-        )
-    end
-end=#
 
 function ctx_gensyms()
     Dict(
         fn => gensym("ctx_" * string(fn)) for fn = fieldnames(AutoWrapContext)
     )
 end
-#=
-function ctx_unpack_expr(ctx_syms, ctx_ex)
-    exprs = [
-        :( $(sym) = getfield($(ctx_ex), $(Meta.quot(fn))) )
-            for (fn, sym) in pairs(ctx_syms)
-    ]
-    return quote $(exprs...) end
-end
 
-function ctx_copy_expr(ctx_copy_syms, ctx_syms)
-    @assert length(ctx_copy_syms) == length(ctx_syms)
-    exprs = [
-        :( const $(csym) = deepcopy($(sym)) )
-            for (csym, sym) = zip(ctx_copy_syms, ctx_syms)
-    ]
-    return quote $(exprs...) end
-end
-=#
-#=
-function make_fallback_noprocessing_expr(func_def, new_name = nothing, arg_types = true)
-    fallback_def = copy(func_def)
-    if !arg_types
-        empty!(fallback_def[:args])
-        append!(fallback_def[:args], fallback_def[:arg_name_exs])
-    end
-    if !isnothing(new_name)
-        fallback_def[:name] = new_name
-    end
-    return ET.combinedef(fallback_def)
-end
-
-function make_fallback_noprocessing_expr_anon(func_def, arg_types = true)
-    fallback_def = copy(func_def)
-    if !arg_types
-        empty!(fallback_def[:args])
-        append!(fallback_def[:args], fallback_def[:arg_name_exs])
-    end
-    if haskey(fallback_def, :name)
-        delete!(fallback_def, :name)
-    end
-    if !(fallback_def[:head] in (:(->), :function))
-        fallback_def[:head] = :function
-    end
-    return ET.combinedef(fallback_def)
-end
-
-function make_fallback_noprocessing_expr_for_user(
-    func_def, anon_name = nothing
-)
-    @assert !isnothing(anon_name)
-    fallback_def = copy(func_def)
-    pushfirst!(fallback_def[:args], :(::$(FallbackNoProcessing)))
-    fallback_def[:body] = quote
-        $(anon_name)($(fallback_def[:arg_name_exs]...))
-    end
-
-    return ET.combinedef(fallback_def)
-end
-
-function make_fallback_expr(func_def, fallback_noprocessing_symb, ctx_preprocessing_symb, ctx_postprocessing_symb)
-    fallback_def = deepcopy(func_def)
-    empty!(fallback_def[:args])
-    push!(fallback_def[:args], :(::$(Fallback)))
-    append!(fallback_def[:args], fallback_def[:arg_name_exs])
-    fallback_def[:body] = quote
-        (_args, meta) = $(ctx_preprocessing_symb)($(Expr(:tuple, fallback_def[:arg_name_exs]...)))
-        #ret = $(fallback_noprocessing_symb)($(FallbackNoProcessing()), _args...)
-        ret = $(fallback_noprocessing_symb)(_args...)
-        return $(ctx_postprocessing_symb)(ret, meta)
-    end
-    return ET.combinedef(fallback_def)
-end
-=#
 function empty_args!(mdict)
     if haskey(mdict, :args)
         empty!(mdict[:args])
@@ -567,7 +613,7 @@ end
 
 # modified version of `ET.signature` to work on Tuple types missing function type as 
 # first parameter
-function signature_without_name(orig_sig::Type{<:Tuple}; extra_hygiene=false)
+function signature_without_name(@nospecialize(orig_sig::Type{<:Tuple}); extra_hygiene=false)
     sig = extra_hygiene ? ET._truly_rename_unionall(orig_sig) : orig_sig
     def = Dict{Symbol, Any}()
 
@@ -578,7 +624,7 @@ function signature_without_name(orig_sig::Type{<:Tuple}; extra_hygiene=false)
 
     arg_types = ET.name_of_type.(ET.parameters(sig))#(ET.argument_types(sig))
     arg_names = [Symbol(:x, ii) for ii in eachindex(arg_types)]
-    def[:args] = Expr.(:(::), arg_names, arg_types)
+    def[:args] = [ Expr(:(::), aname, atype) for (aname, atype) = zip(arg_names, arg_types) ]
     def[:whereparams] = ET.where_parameters(sig)
 
     filter!(kv->last(kv)!==nothing, def)  # filter out nonfields.
@@ -593,6 +639,23 @@ function _match_argnames!(sig_dict, arg_name_exs)
         push!(sig_dict[:args], :($(arg_name_exs[i])::$(_arg_type_expr(arg_ex))))
     end
     nothing
+end
+
+function strip_lineno(expr::Expr)
+    return strip_lineno!(copy(expr))
+end
+
+# taken from `strip_lineno` in ExprTools/test/function.jl
+function strip_lineno!(expr::Expr)
+    filter!(expr.args) do ex
+        isa(ex, LineNumberNode) && return false
+        if isa(ex, Expr)
+            ex.head === :line && return false
+            strip_lineno!(ex::Expr)
+        end
+        return true
+    end
+    return expr
 end
 
 end#module
