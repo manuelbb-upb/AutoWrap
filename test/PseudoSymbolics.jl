@@ -39,7 +39,7 @@ arg_type_mapping = function (type)
     end
 end
 preprocessing_function = function (args...)
-    ((AW.NewDef(), (iswrapped(a) ? unwrap(a) : a for a in args)...), nothing)
+    ((AW.NewDefTyped(), (iswrapped(a) ? unwrap(a) : a for a in args)...), nothing)
 end
 
 function new_method_condition(T)
